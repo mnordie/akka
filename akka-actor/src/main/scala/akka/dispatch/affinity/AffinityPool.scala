@@ -28,215 +28,42 @@ import akka.util.OptionVal
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
-/**
- * An [[ExecutorService]] implementation which pins actor to particular threads
- * and guaranteed that an actor's [[Mailbox]] will e run on the thread it used
- * it used to run. In situations where we see a lot of cache ping pong, this
- * might lead to significant performance improvements.
- *
- * INTERNAL API
- */
 @InternalApi
 @ApiMayChange
-private[akka] class AffinityPool(
-  parallelism:               Int,
-  affinityGroupSize:         Int,
-  tf:                        ThreadFactory,
-  idleCpuLevel:              Int,
-  fairDistributionThreshold: Int,
-  rejectionHandler:          RejectionHandler)
-  extends AbstractExecutorService {
+private[affinity] object AffinityPool {
+  type PoolState = Int
+  // PoolState: accepts new tasks and processes tasks that are enqueued
+  final val Running = 0
+  // PoolState: does not accept new tasks, processes tasks that are in the queue
+  final val ShuttingDown = 1
+  // PoolState: does not accept new tasks, does not process tasks in queue
+  final val ShutDown = 2
+  // PoolState: all threads have been stopped, does not process tasks and does not accept new ones
+  final val Terminated = 3
 
-  if (parallelism <= 0)
-    throw new IllegalArgumentException("Size of pool cannot be less or equal to 0")
+  type WorkerState = Int
+  // WorkerState: Worker not started
+  final val NotStarted = 0
+  // WorkerState: Worker executing task
+  final val InExecution = 1
+  // WorkerState: Worker idling
+  final val Idle = 2
 
-  // Held while starting/shutting down workers/pool in order to make
-  // the operations linear and enforce atomicity. An example of that would be
-  // adding a worker. We want the creation of the worker, addition
-  // to the set and starting to worker to be an atomic action. Using
-  // a concurrent set would not give us that
-  private val bookKeepingLock = new ReentrantLock()
-
-  // condition used for awaiting termination
-  private val terminationCondition = bookKeepingLock.newCondition()
-
-  // indicates the current state of the pool
-  @volatile final private var poolState: PoolState = Running
-
-  private final val workQueues = Array.fill(parallelism)(new BoundedTaskQueue(affinityGroupSize))
-  private final val workers = mutable.Set[ThreadPoolWorker]()
-
-  // a counter that gets incremented every time a task is queued
-  private val executionCounter: AtomicInteger = new AtomicInteger(0)
-  // maps a runnable to an index of a worker queue
-  private val runnableToWorkerQueueIndex = new AtomicReference(ImmutableIntMap.empty)
-
-  private def locked[T](l: Lock)(body: ⇒ T) = {
-    l.lock()
-    try {
-      body
-    } finally {
-      l.unlock()
+  // Method handle to JDK9+ onSpinWait method
+  private val onSpinWaitMethodHandle =
+    try
+      OptionVal.Some(MethodHandles.lookup.findStatic(classOf[Thread], "onSpinWait", methodType(classOf[Unit])))
+    catch {
+      case NonFatal(_) ⇒ OptionVal.None
     }
-  }
-
-  private def getQueueForRunnable(command: Runnable) = {
-
-    val runnableHash = command.hashCode()
-
-    def sbhash(i: Int) = reverseBytes(i * 0x9e3775cd) * 0x9e3775cd
-
-    def getNext = executionCounter.incrementAndGet() % parallelism
-
-    def updateIfAbsentAndGetQueueIndex(
-      workerQueueIndex: AtomicReference[ImmutableIntMap],
-      runnableHash:     Int, queueIndex: ⇒ Int): Int = {
-      @tailrec
-      def updateIndex(): Unit = {
-        val prev = workerQueueIndex.get()
-        if (!runnableToWorkerQueueIndex.compareAndSet(prev, prev.updateIfAbsent(runnableHash, queueIndex))) {
-          updateIndex()
-        }
-      }
-      updateIndex()
-      workerQueueIndex.get().get(runnableHash) // can safely call get..
-    }
-
-    val workQueueIndex =
-      if (fairDistributionThreshold == 0 || runnableToWorkerQueueIndex.get().size > fairDistributionThreshold)
-        Math.abs(sbhash(runnableHash)) % parallelism
-      else
-        updateIfAbsentAndGetQueueIndex(runnableToWorkerQueueIndex, runnableHash, getNext)
-
-    workQueues(workQueueIndex)
-  }
-
-  //fires up initial workers
-  locked(bookKeepingLock) {
-    workQueues.foreach(q ⇒ addWorker(workers, q))
-  }
-
-  private def addWorker(workers: mutable.Set[ThreadPoolWorker], q: BoundedTaskQueue): Unit = {
-    locked(bookKeepingLock) {
-      val worker = new ThreadPoolWorker(q, new IdleStrategy(idleCpuLevel))
-      workers.add(worker)
-      worker.startWorker()
-    }
-  }
-
-  private def tryEnqueue(command: Runnable) = getQueueForRunnable(command).add(command)
-
-  /**
-   * Each worker should go through that method while terminating.
-   * In turn each worker is responsible for modifying the pool
-   * state accordingly. For example if this is the last worker
-   * and the queue is empty and we are in a ShuttingDown state
-   * the worker can transition the pool to ShutDown and attempt
-   * termination
-   *
-   * Furthermore, if this worker has experienced abrupt termination
-   * due to an exception being thrown in user code, the worker is
-   * responsible for adding one more worker to compensate for its
-   * own termination
-   *
-   */
-  private def onWorkerExit(w: ThreadPoolWorker, abruptTermination: Boolean): Unit =
-    locked(bookKeepingLock) {
-      workers.remove(w)
-      if (workers.isEmpty && !abruptTermination && poolState >= ShuttingDown) {
-        poolState = ShutDown // transition to shutdown and try to transition to termination
-        attemptPoolTermination()
-      }
-      if (abruptTermination && poolState == Running)
-        addWorker(workers, w.q)
-    }
-
-  override def execute(command: Runnable): Unit = {
-    if (command == null)
-      throw new NullPointerException
-    if (!(poolState == Running && tryEnqueue(command)))
-      rejectionHandler.reject(command, this)
-  }
-
-  override def awaitTermination(timeout: Long, unit: TimeUnit): Boolean = {
-
-    // recurse until pool is terminated or time out reached
-    @tailrec
-    def awaitTermination(nanos: Long): Boolean = {
-      if (poolState == Terminated) true
-      else if (nanos <= 0) false
-      else awaitTermination(terminationCondition.awaitNanos(nanos))
-    }
-
-    locked(bookKeepingLock) {
-      // need to hold the lock to avoid monitor exception
-      awaitTermination(unit.toNanos(timeout))
-    }
-
-  }
-
-  private def attemptPoolTermination() =
-    locked(bookKeepingLock) {
-      if (workers.isEmpty && poolState == ShutDown) {
-        poolState = Terminated
-        terminationCondition.signalAll()
-      }
-    }
-
-  override def shutdownNow(): util.List[Runnable] =
-    locked(bookKeepingLock) {
-      poolState = ShutDown
-      workers.foreach(_.stop())
-      attemptPoolTermination()
-      // like in the FJ executor, we do not provide facility to obtain tasks that were in queue
-      Collections.emptyList[Runnable]()
-    }
-
-  override def shutdown(): Unit =
-    locked(bookKeepingLock) {
-      poolState = ShuttingDown
-      // interrupts only idle workers.. so others can process their queues
-      workers.foreach(_.stopIfIdle())
-      attemptPoolTermination()
-    }
-
-  override def isShutdown: Boolean = poolState == ShutDown
-
-  override def isTerminated: Boolean = poolState == Terminated
 
   // Following are auxiliary class and trait definitions
-
-  private sealed trait PoolState extends Ordered[PoolState] {
-    def order: Int
-    override def compare(that: PoolState): Int = this.order compareTo that.order
-  }
-
-  // accepts new tasks and processes tasks that are enqueued
-  private case object Running extends PoolState {
-    override val order: Int = 0
-  }
-
-  // does not accept new tasks, processes tasks that are in the queue
-  private case object ShuttingDown extends PoolState {
-    override def order: Int = 1
-  }
-
-  // does not accept new tasks, does not process tasks in queue
-  private case object ShutDown extends PoolState {
-    override def order: Int = 2
-  }
-
-  // all threads have been stopped, does not process tasks and does not accept new ones
-  private case object Terminated extends PoolState {
-    override def order: Int = 3
-  }
-
   private final class IdleStrategy(val idleCpuLevel: Int) {
 
-    private val maxSpins = 1100 * idleCpuLevel - 1000
-    private val maxYields = 5 * idleCpuLevel
-    private val minParkPeriodNs = 1
-    private val maxParkPeriodNs = MICROSECONDS.toNanos(280 - 30 * idleCpuLevel)
+    private[this] val maxSpins = 1100 * idleCpuLevel - 1000
+    private[this] val maxYields = 5 * idleCpuLevel
+    private[this] val minParkPeriodNs = 1
+    private[this] val maxParkPeriodNs = MICROSECONDS.toNanos(280 - 30 * idleCpuLevel)
 
     private sealed trait State
     private case object NotIdle extends State
@@ -244,17 +71,10 @@ private[akka] class AffinityPool(
     private case object Yielding extends State
     private case object Parking extends State
 
-    private var state: State = NotIdle
-    private var spins = 0L
-    private var yields = 0L
-    private var parkPeriodNs = 0L
-
-    private val onSpinWaitMethodHandle =
-      try
-        OptionVal.Some(MethodHandles.lookup.findStatic(classOf[Thread], "onSpinWait", methodType(classOf[Unit])))
-      catch {
-        case NonFatal(_) ⇒ OptionVal.None
-      }
+    private[this] var state: State = NotIdle
+    private[this] var spins = 0L
+    private[this] var yields = 0L
+    private[this] var parkPeriodNs = 0L
 
     def idle(): Unit = {
       state match {
@@ -288,27 +108,192 @@ private[akka] class AffinityPool(
       yields = 0
       state = NotIdle
     }
-
   }
 
-  private final class BoundedTaskQueue(capacity: Int) extends AbstractBoundedNodeQueue[Runnable](capacity)
+  private final class BoundedAffinityTaskQueue(capacity: Int) extends AbstractBoundedNodeQueue[Runnable](capacity)
+}
 
-  private final class ThreadPoolWorker(val q: BoundedTaskQueue, val idleStrategy: IdleStrategy) extends Runnable {
+/**
+ * An [[ExecutorService]] implementation which pins actor to particular threads
+ * and guaranteed that an actor's [[Mailbox]] will e run on the thread it used
+ * it used to run. In situations where we see a lot of cache ping pong, this
+ * might lead to significant performance improvements.
+ *
+ * INTERNAL API
+ */
+@InternalApi
+@ApiMayChange
+private[akka] class AffinityPool(
+  parallelism:                         Int,
+  affinityGroupSize:                   Int,
+  tf:                                  ThreadFactory,
+  idleCpuLevel:                        Int,
+  final val fairDistributionThreshold: Int,
+  rejectionHandler:                    RejectionHandler)
+  extends AbstractExecutorService {
 
-    private sealed trait WorkerState
-    private case object NotStarted extends WorkerState
-    private case object InExecution extends WorkerState
-    private case object Idle extends WorkerState
+  if (parallelism <= 0)
+    throw new IllegalArgumentException("Size of pool cannot be less or equal to 0")
 
+  import AffinityPool._
+
+  // Held while starting/shutting down workers/pool in order to make
+  // the operations linear and enforce atomicity. An example of that would be
+  // adding a worker. We want the creation of the worker, addition
+  // to the set and starting to worker to be an atomic action. Using
+  // a concurrent set would not give us that
+  private val bookKeepingLock = new ReentrantLock()
+
+  // condition used for awaiting termination
+  private val terminationCondition = bookKeepingLock.newCondition()
+
+  // indicates the current state of the pool
+  @volatile final private var poolState: PoolState = Running
+
+  private final val workQueues = Array.fill(parallelism)(new BoundedAffinityTaskQueue(affinityGroupSize))
+  private final val workers = mutable.Set[AffinityPoolWorker]()
+
+  // maps a runnable to an index of a worker queue
+  private[this] final val runnableToWorkerQueueIndex = new AtomicReference(ImmutableIntMap.empty)
+
+  @inline private def locked[T](body: ⇒ T): T = {
+    bookKeepingLock.lock()
+    try {
+      body
+    } finally {
+      bookKeepingLock.unlock()
+    }
+  }
+
+  private def getQueueForRunnable(command: Runnable): BoundedAffinityTaskQueue = {
+    val runnableHash = command.hashCode()
+
+    def indexFor(h: Int): Int =
+      Math.abs(reverseBytes(h * 0x9e3775cd) * 0x9e3775cd) % parallelism // In memory of Phil Bagwell
+
+    val workQueueIndex =
+      if (fairDistributionThreshold == 0)
+        indexFor(runnableHash)
+      else {
+        @tailrec
+        def updateAndOrGetIndex(): Int = {
+          val prev = runnableToWorkerQueueIndex.get()
+          if (prev.size > fairDistributionThreshold) indexFor(runnableHash)
+          else {
+            val existingIndex = prev.get(runnableHash)
+            if (existingIndex >= 0) existingIndex
+            else {
+              val index = prev.size % parallelism
+              val next = prev.updated(runnableHash, index)
+              if (runnableToWorkerQueueIndex.compareAndSet(prev, next)) index // Successfully added key
+              else updateAndOrGetIndex() // Try again
+            }
+          }
+        }
+
+        updateAndOrGetIndex()
+      }
+
+    workQueues(workQueueIndex)
+  }
+
+  //fires up initial workers
+  locked {
+    workQueues.foreach(q ⇒ addWorker(workers, q))
+  }
+
+  private def addWorker(workers: mutable.Set[AffinityPoolWorker], q: BoundedAffinityTaskQueue): Unit = {
+    locked {
+      val worker = new AffinityPoolWorker(q, new IdleStrategy(idleCpuLevel))
+      workers.add(worker)
+      worker.startWorker()
+    }
+  }
+
+  /**
+   * Each worker should go through that method while terminating.
+   * In turn each worker is responsible for modifying the pool
+   * state accordingly. For example if this is the last worker
+   * and the queue is empty and we are in a ShuttingDown state
+   * the worker can transition the pool to ShutDown and attempt
+   * termination
+   *
+   * Furthermore, if this worker has experienced abrupt termination
+   * due to an exception being thrown in user code, the worker is
+   * responsible for adding one more worker to compensate for its
+   * own termination
+   *
+   */
+  private def onWorkerExit(w: AffinityPoolWorker, abruptTermination: Boolean): Unit =
+    locked {
+      workers.remove(w)
+      if (workers.isEmpty && !abruptTermination && poolState >= ShuttingDown) {
+        poolState = ShutDown // transition to shutdown and try to transition to termination
+        attemptPoolTermination()
+      }
+      if (abruptTermination && poolState == Running)
+        addWorker(workers, w.q)
+    }
+
+  override def execute(command: Runnable): Unit = {
+    val queue = getQueueForRunnable(command) // Will throw NPE if command is null
+    if (poolState != Running || !queue.add(command))
+      rejectionHandler.reject(command, this)
+  }
+
+  override def awaitTermination(timeout: Long, unit: TimeUnit): Boolean = {
+    // recurse until pool is terminated or time out reached
+    @tailrec
+    def awaitTermination(nanos: Long): Boolean = {
+      if (poolState == Terminated) true
+      else if (nanos <= 0) false
+      else awaitTermination(terminationCondition.awaitNanos(nanos))
+    }
+
+    locked {
+      // need to hold the lock to avoid monitor exception
+      awaitTermination(unit.toNanos(timeout))
+    }
+  }
+
+  // WARNING: Only call while holding the bookKeepingLock
+  private def attemptPoolTermination(): Unit =
+    if (workers.isEmpty && poolState == ShutDown) {
+      poolState = Terminated
+      terminationCondition.signalAll()
+    }
+
+  override def shutdownNow(): util.List[Runnable] =
+    locked {
+      poolState = ShutDown
+      workers.foreach(_.stop())
+      attemptPoolTermination()
+      // like in the FJ executor, we do not provide facility to obtain tasks that were in queue
+      Collections.emptyList[Runnable]()
+    }
+
+  override def shutdown(): Unit =
+    locked {
+      poolState = ShuttingDown
+      // interrupts only idle workers.. so others can process their queues
+      workers.foreach(_.stopIfIdle())
+      attemptPoolTermination()
+    }
+
+  override def isShutdown: Boolean = poolState >= ShutDown
+
+  override def isTerminated: Boolean = poolState == Terminated
+
+  private final class AffinityPoolWorker(val q: BoundedAffinityTaskQueue, val idleStrategy: IdleStrategy) extends Runnable {
     val thread: Thread = tf.newThread(this)
-    @volatile private var workerState: WorkerState = NotStarted
+    @volatile private[this] var workerState: WorkerState = NotStarted
 
     def startWorker(): Unit = {
       workerState = Idle
       thread.start()
     }
 
-    private def runCommand(command: Runnable) = {
+    private[this] def runCommand(command: Runnable): Unit = {
       workerState = InExecution
       try
         command.run()
@@ -351,15 +336,14 @@ private[akka] class AffinityPool(
       }
     }
 
-    def stop() =
+    def stop(): Unit =
       if (!thread.isInterrupted && workerState != NotStarted)
         thread.interrupt()
 
-    def stopIfIdle() =
+    def stopIfIdle(): Unit =
       if (workerState == Idle)
         stop()
   }
-
 }
 
 /**
@@ -370,7 +354,7 @@ private[akka] class AffinityPool(
 private[akka] final class AffinityPoolConfigurator(config: Config, prerequisites: DispatcherPrerequisites)
   extends ExecutorServiceConfigurator(config, prerequisites) {
 
-  private final val MaxfairDistributionThreshold = 2048
+  private final val MaxFairDistributionThreshold = 2048
 
   private val poolSize = ThreadPoolConfig.scaledPoolSize(
     config.getInt("parallelism-min"),
@@ -382,14 +366,14 @@ private[akka] final class AffinityPoolConfigurator(config: Config, prerequisites
     1 <= level && level <= 10, "idle-cpu-level must be between 1 and 10")
 
   private val fairDistributionThreshold = config.getInt("fair-work-distribution-threshold").requiring(thr ⇒
-    0 <= thr && thr <= MaxfairDistributionThreshold, s"idle-cpu-level must be between 1 and $MaxfairDistributionThreshold")
+    0 <= thr && thr <= MaxFairDistributionThreshold, s"fair-work-distribution-threshold must be between 0 and $MaxFairDistributionThreshold")
 
   private val rejectionHandlerFCQN = config.getString("rejection-handler-factory")
 
   private val rejectionHandlerFactory = prerequisites.dynamicAccess
     .createInstanceFor[RejectionHandlerFactory](rejectionHandlerFCQN, Nil).recover({
       case exception ⇒ throw new IllegalArgumentException(
-        s"Cannot instantiate RejectionHandlerFactory (rejection-handler-factory = $rejectionHandlerFCQN),make sure it has an accessible empty constructor",
+        s"Cannot instantiate RejectionHandlerFactory (rejection-handler-factory = $rejectionHandlerFCQN), make sure it has an accessible empty constructor",
         exception)
     }).get
 
@@ -416,7 +400,7 @@ trait RejectionHandlerFactory {
 private[akka] final class DefaultRejectionHandlerFactory extends RejectionHandlerFactory {
   private class DefaultRejectionHandler extends RejectionHandler {
     override def reject(command: Runnable, service: ExecutorService): Unit =
-      throw new RejectedExecutionException(s"Task ${command.toString} rejected from ${service.toString}")
+      throw new RejectedExecutionException(s"Task $command rejected from $service")
   }
   override def create(): RejectionHandler = new DefaultRejectionHandler()
 }
