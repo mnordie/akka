@@ -20,18 +20,19 @@ import scala.annotation.tailrec
  * structural sharing, it's intended for rather small maps (<1000 elements).
  */
 @InternalApi private[akka] final class ImmutableIntMap private (private final val kvs: Array[Long]) {
-  final val size: Int = kvs.length
+  final def size: Int = kvs.length
 
   private[this] final def indexForKey(key: Int): Int = {
+    // Binary search (reimplemented due to long-array encoding)
     @tailrec def find(lo: Int, hi: Int): Int =
       if (lo <= hi) {
-        val at = (lo + hi) >>> 1
+        val at = (lo + hi) >>> 1 // https://research.googleblog.com/2006/06/extra-extra-read-all-about-it-nearly.html
         val eKey = keyFromEntry(kvs(at))
         if (eKey < key) find(at + 1, hi)
         else if (eKey > key) find(lo, at - 1)
         else at
       } else -(lo + 1)
-    find(0, size - 1)
+    find(0, kvs.length - 1)
   }
 
   @inline private[this] final def entry(key: Int, value: Int): Long = (key.toLong << 32) | (value & 0xffffffffL)
@@ -43,16 +44,17 @@ import scala.annotation.tailrec
    * Will return Int.MinValue if not found, so beware of storing Int.MinValues
    */
   final def get(key: Int): Int = {
+    // Binary search (reimplemented due to long-array encoding)
     @tailrec def find(lo: Int, hi: Int): Int =
       if (lo <= hi) {
-        val at = (lo + hi) >>> 1
+        val at = (lo + hi) >>> 1 // https://research.googleblog.com/2006/06/extra-extra-read-all-about-it-nearly.html
         val e = kvs(at)
         val eKey = keyFromEntry(e)
         if (eKey < key) find(at + 1, hi)
         else if (eKey > key) find(lo, at - 1)
         else valueFromEntry(e)
       } else Int.MinValue // MinValue is equivalent of Not Found
-    find(0, size - 1)
+    find(0, kvs.length - 1)
   }
 
   /**
@@ -61,7 +63,7 @@ import scala.annotation.tailrec
   final def contains(key: Int): Boolean = indexForKey(key) >= 0
 
   final def updateIfAbsent(key: Int, value: ⇒ Int): ImmutableIntMap =
-    if (size > 0) {
+    if (kvs.length > 0) {
       val i = indexForKey(key)
       if (i >= 0) this
       else insert(key, value, i)
@@ -72,7 +74,7 @@ import scala.annotation.tailrec
    * with the given key with the given value.
    */
   final def updated(key: Int, value: Int): ImmutableIntMap =
-    if (size > 0) {
+    if (kvs.length > 0) {
       val i = indexForKey(key)
       if (i >= 0) update(key, value, i)
       else insert(key, value, i)
@@ -87,20 +89,22 @@ import scala.annotation.tailrec
   private[this] final def insert(key: Int, value: Int, index: Int): ImmutableIntMap = {
     // insert the entry at the right position—keep the array sorted
     val at = -(index + 1)
-    val newKvs = new Array[Long](size + 1)
+    val len = kvs.length
+    val newKvs = new Array[Long](len + 1)
     System.arraycopy(kvs, 0, newKvs, 0, at)
     newKvs(at) = entry(key, value)
-    System.arraycopy(kvs, at, newKvs, at + 1, kvs.length - at)
+    System.arraycopy(kvs, at, newKvs, at + 1, len - at)
     new ImmutableIntMap(newKvs)
   }
 
   final def remove(key: Int): ImmutableIntMap = {
     val i = indexForKey(key)
     if (i >= 0) {
-      if (size > 1) {
-        val newKvs = new Array[Long](size - 1)
+      val len = kvs.length
+      if (len > 1) {
+        val newKvs = new Array[Long](len - 1)
         System.arraycopy(kvs, 0, newKvs, 0, i)
-        System.arraycopy(kvs, i + 1, newKvs, i, size - i - 1)
+        System.arraycopy(kvs, i + 1, newKvs, i, len - i - 1)
         new ImmutableIntMap(newKvs)
       } else ImmutableIntMap.empty
     } else this
