@@ -70,20 +70,20 @@ import scala.annotation.tailrec
   final def updated(key: Int, value: Int): ImmutableIntMap =
     if (size > 0) {
       val i = indexForKey(key)
-      if (i >= 0) update(key, value, i)
-      else insert(key, value, i)
+      if (i >= 0) {
+        val valueIndex = i + 1
+        if (kvs(valueIndex) != value) update(value, valueIndex) else this // If no change no need to copy anything
+      } else insert(key, value, i)
     } else new ImmutableIntMap(Array(key, value), 1)
 
-  private[this] final def update(key: Int, value: Int, index: Int): ImmutableIntMap = {
+  private[this] final def update(value: Int, valueIndex: Int): ImmutableIntMap = {
     val newKvs = kvs.clone()
-    newKvs(index) = key
-    newKvs(index + 1) = value
+    newKvs(valueIndex) = value
     new ImmutableIntMap(newKvs, size)
   }
 
   private[this] final def insert(key: Int, value: Int, index: Int): ImmutableIntMap = {
-    // insert the entry at the right position—keep the array sorted
-    val at = -(index + 1)
+    val at = -(index + 1) // insert the entry at the right position—keep the array sorted
     val newKvs = new Array[Int](kvs.length + 2)
     System.arraycopy(kvs, 0, newKvs, 0, at)
     newKvs(at) = key
