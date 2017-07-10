@@ -17,7 +17,7 @@ import akka.dispatch._
 import akka.util.Helpers.Requiring
 import com.typesafe.config.Config
 
-import scala.annotation.tailrec
+import scala.annotation.{ tailrec, switch }
 import java.lang.Integer.reverseBytes
 
 import akka.annotation.InternalApi
@@ -57,6 +57,16 @@ private[affinity] object AffinityPool {
       case NonFatal(_) ⇒ OptionVal.None
     }
 
+  type IdleState = Int
+  // IdleState: Initial state
+  final val Initial = 0
+  // IdleState: Spinning
+  final val Spinning = 1
+  // IdleState: Yielding
+  final val Yielding = 2
+  // IdleState: Parking
+  final val Parking = 3
+
   // Following are auxiliary class and trait definitions
   private final class IdleStrategy(val idleCpuLevel: Int) {
 
@@ -65,20 +75,14 @@ private[affinity] object AffinityPool {
     private[this] val minParkPeriodNs = 1
     private[this] val maxParkPeriodNs = MICROSECONDS.toNanos(280 - 30 * idleCpuLevel)
 
-    private sealed trait State
-    private case object NotIdle extends State
-    private case object Spinning extends State
-    private case object Yielding extends State
-    private case object Parking extends State
-
-    private[this] var state: State = NotIdle
+    private[this] var state: IdleState = Initial
     private[this] var spins = 0L
     private[this] var yields = 0L
     private[this] var parkPeriodNs = 0L
 
     def idle(): Unit = {
-      state match {
-        case NotIdle ⇒
+      (state: @switch) match {
+        case Initial ⇒
           state = Spinning
           spins += 1
         case Spinning ⇒
@@ -106,7 +110,7 @@ private[affinity] object AffinityPool {
     def reset(): Unit = {
       spins = 0
       yields = 0
-      state = NotIdle
+      state = Initial
     }
   }
 
