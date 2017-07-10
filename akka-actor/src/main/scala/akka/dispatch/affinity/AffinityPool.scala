@@ -289,7 +289,7 @@ private[akka] class AffinityPool(
   override def isTerminated: Boolean = poolState == Terminated
 
   private final class AffinityPoolWorker(val q: BoundedAffinityTaskQueue, val idleStrategy: IdleStrategy) extends Runnable {
-    val thread: Thread = tf.newThread(this)
+    final val thread: Thread = tf.newThread(this)
     @volatile private[this] var workerState: WorkerState = NotStarted
 
     def startWorker(): Unit = {
@@ -297,7 +297,7 @@ private[akka] class AffinityPool(
       thread.start()
     }
 
-    private[this] def runCommand(command: Runnable): Unit = {
+    private[this] final def runCommand(command: Runnable): Unit = {
       workerState = InExecution
       try
         command.run()
@@ -305,8 +305,7 @@ private[akka] class AffinityPool(
         workerState = Idle
     }
 
-    override def run(): Unit = {
-
+    override final def run(): Unit = {
       /**
        * Determines whether the worker can keep running or not.
        * In order to continue polling for tasks three conditions
@@ -319,21 +318,23 @@ private[akka] class AffinityPool(
        *
        * 3) We are not in ShutDown state (in which we should not be processing any enqueued tasks)
        */
-      def shouldKeepRunning =
-        (poolState < ShuttingDown || !q.isEmpty) &&
-          !Thread.interrupted() &&
-          poolState != ShutDown
-
-      var abruptTermination = true
-      try {
-        while (shouldKeepRunning) {
+      @tailrec def runLoop(): Unit = {
+        val ps = poolState
+        if ((ps < ShuttingDown || !q.isEmpty) && !Thread.interrupted() && ps != ShutDown) {
           val c = q.poll()
           if (c ne null) {
             runCommand(c)
             idleStrategy.reset()
-          } else // if not wait for a bit
-            idleStrategy.idle()
+          } else {
+            idleStrategy.idle() // if not wait for a bit
+          }
+          runLoop()
         }
+      }
+
+      var abruptTermination = true
+      try {
+        runLoop()
         abruptTermination = false // if we have reached here, our termination is not due to an exception
       } finally {
         onWorkerExit(this, abruptTermination)
