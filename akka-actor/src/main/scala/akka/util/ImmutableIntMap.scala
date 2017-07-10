@@ -28,12 +28,12 @@ import scala.annotation.tailrec
     @tailrec def find(lo: Int, hi: Int): Int =
       if (lo <= hi) {
         val lohi = lo + hi // Since we search in half the array we don't need to div by 2 to find the real index of key
-        val idx = lohi & ~1 // We simply need to round down lo+hi by removing the lowest bit if set
+        val idx = lohi & ~1 // Since keys are in even slots, we get the key idx from lo+hi by removing the lowest bit if set (odd)
         val k = kvs(idx)
         if (k < key) find((lohi >>> 1) + 1, hi)
         else if (k > key) find(lo, (lohi >>> 1) - 1)
         else idx
-      } else -((lo << 1) + 1) // Item should be placed in lo*2+1, negate it to indicate no match
+      } else -((lo << 1) + 1) // Item should be placed in lo*2+1, negated to indicate no match
 
     find(0, size - 1)
   }
@@ -43,18 +43,8 @@ import scala.annotation.tailrec
    * Will return Int.MinValue if not found, so beware of storing Int.MinValues
    */
   final def get(key: Int): Int = {
-    // See algorithm description in `indexForKey`
-    @tailrec def get(lo: Int, hi: Int): Int =
-      if (lo <= hi) {
-        val lohi = lo + hi
-        val idx = lohi & ~1
-        val k = kvs(idx)
-        if (k < key) get((lohi >>> 1) + 1, hi)
-        else if (k > key) get(lo, (lohi >>> 1) - 1)
-        else kvs(idx + 1)
-      } else Int.MinValue
-
-    get(0, size - 1)
+    val i = indexForKey(key)
+    if (i >= 0) kvs(i + 1) else Int.MinValue
   }
 
   /**
@@ -62,6 +52,10 @@ import scala.annotation.tailrec
    */
   final def contains(key: Int): Boolean = indexForKey(key) >= 0
 
+  /**
+   * Worst case `O(n)`, creates new `ImmutableIntMap`
+   * with the given key and value if that key is not yet present in the map.
+   */
   final def updateIfAbsent(key: Int, value: ⇒ Int): ImmutableIntMap =
     if (size > 0) {
       val i = indexForKey(key)
@@ -70,7 +64,7 @@ import scala.annotation.tailrec
     } else new ImmutableIntMap(Array(key, value), 1)
 
   /**
-   * Worst case `O(log n)`, creates new `ImmutableIntMap`
+   * Worst case `O(n)`, creates new `ImmutableIntMap`
    * with the given key with the given value.
    */
   final def updated(key: Int, value: Int): ImmutableIntMap =
@@ -98,6 +92,10 @@ import scala.annotation.tailrec
     new ImmutableIntMap(newKvs, size + 1)
   }
 
+  /**
+   * Worst case `O(n)`, creates new `ImmutableIntMap`
+   * without the given key.
+   */
   final def remove(key: Int): ImmutableIntMap = {
     val i = indexForKey(key)
     if (i >= 0) {
