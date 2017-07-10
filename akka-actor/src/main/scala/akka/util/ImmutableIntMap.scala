@@ -16,7 +16,7 @@ import scala.annotation.tailrec
 /**
  * INTERNAL API
  * Specialized Map for primitive `Int` keys and values to avoid allocations (boxing).
- * Keys and values are encoded consequtively in a single Int array and does copy-on-write with no
+ * Keys and values are encoded consecutively in a single Int array and does copy-on-write with no
  * structural sharing, it's intended for rather small maps (<1000 elements).
  */
 @InternalApi private[akka] final class ImmutableIntMap private (private final val kvs: Array[Int], final val size: Int) {
@@ -27,8 +27,8 @@ import scala.annotation.tailrec
     // >>> 1 for division by 2: https://research.googleblog.com/2006/06/extra-extra-read-all-about-it-nearly.html
     @tailrec def find(lo: Int, hi: Int): Int =
       if (lo <= hi) {
-        val lohi = lo + hi // Since we search in half the array we don't need to div by 2 to find the real index if item
-        val idx = lohi & ~1 // We simply need to round down lo+hi
+        val lohi = lo + hi // Since we search in half the array we don't need to div by 2 to find the real index of key
+        val idx = lohi & ~1 // We simply need to round down lo+hi by removing the lowest bit if set
         val k = kvs(idx)
         if (k < key) find((lohi >>> 1) + 1, hi)
         else if (k > key) find(lo, (lohi >>> 1) - 1)
@@ -115,15 +115,7 @@ import scala.annotation.tailrec
    */
   final def keysIterator: Iterator[Int] =
     if (size < 1) Iterator.empty
-    else new Iterator[Int] {
-      private[this] var idx = 0
-      override def hasNext: Boolean = idx < kvs.length
-      override def next: Int = {
-        var value = kvs(idx)
-        idx += 2
-        value
-      }
-    }
+    else Iterator.range(0, kvs.length - 1, 2).map(kvs.apply)
 
   override final def toString: String =
     if (size < 1) "ImmutableIntMap()"
