@@ -79,8 +79,7 @@ private[affinity] object AffinityPool {
     def idle(): Unit = {
       (state: @switch) match {
         case Initial ⇒
-          state = Spinning
-          turns += 1
+          transitionTo(Spinning)
         case Spinning ⇒
           onSpinWaitMethodHandle match {
             case OptionVal.Some(m) ⇒ m.invokeExact()
