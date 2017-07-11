@@ -68,30 +68,32 @@ private[affinity] object AffinityPool {
     private[this] val maxParkPeriodNs = MICROSECONDS.toNanos(280 - 30 * idleCpuLevel)
 
     private[this] var state: IdleState = Initial
-    private[this] var spins = 0L
-    private[this] var yields = 0L
+    private[this] var turns = 0L
     private[this] var parkPeriodNs = 0L
+
+    @inline private[this] final def transitionTo(newState: IdleState): Unit = {
+      state = newState
+      turns = 0
+    }
 
     def idle(): Unit = {
       (state: @switch) match {
         case Initial ⇒
           state = Spinning
-          spins += 1
+          turns += 1
         case Spinning ⇒
           onSpinWaitMethodHandle match {
             case OptionVal.Some(m) ⇒ m.invokeExact()
             case OptionVal.None    ⇒
           }
-          spins += 1
-          if (spins > maxSpins) {
-            state = Yielding
-            yields = 0
-          }
+          turns += 1
+          if (turns > maxSpins)
+            transitionTo(Yielding)
         case Yielding ⇒
-          yields += 1
-          if (yields > maxYields) {
-            state = Parking
+          turns += 1
+          if (turns > maxYields) {
             parkPeriodNs = minParkPeriodNs
+            transitionTo(Parking)
           } else Thread.`yield`()
         case Parking ⇒
           LockSupport.parkNanos(parkPeriodNs)
@@ -99,11 +101,7 @@ private[affinity] object AffinityPool {
       }
     }
 
-    def reset(): Unit = {
-      spins = 0
-      yields = 0
-      state = Initial
-    }
+    final def reset(): Unit = transitionTo(Initial)
   }
 
   private final class BoundedAffinityTaskQueue(capacity: Int) extends AbstractBoundedNodeQueue[Runnable](capacity)
