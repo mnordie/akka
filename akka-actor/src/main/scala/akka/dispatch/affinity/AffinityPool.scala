@@ -41,14 +41,6 @@ private[affinity] object AffinityPool {
   // PoolState: all threads have been stopped, does not process tasks and does not accept new ones
   final val Terminated = 3
 
-  type WorkerState = Int
-  // WorkerState: Worker not started
-  final val NotStarted = 0
-  // WorkerState: Worker executing task
-  final val InExecution = 1
-  // WorkerState: Worker idling
-  final val Idle = 2
-
   // Method handle to JDK9+ onSpinWait method
   private val onSpinWaitMethodHandle =
     try
@@ -290,19 +282,16 @@ private[akka] class AffinityPool(
 
   private final class AffinityPoolWorker(val q: BoundedAffinityTaskQueue, val idleStrategy: IdleStrategy) extends Runnable {
     final val thread: Thread = tf.newThread(this)
-    @volatile private[this] var workerState: WorkerState = NotStarted
+    @volatile private[this] var executing: Boolean = false
 
-    def startWorker(): Unit = {
-      workerState = Idle
-      thread.start()
-    }
+    def startWorker(): Unit = thread.start()
 
     private[this] final def runCommand(command: Runnable): Unit = {
-      workerState = InExecution
+      executing = true
       try
         command.run()
       finally
-        workerState = Idle
+        executing = false
     }
     override final def run(): Unit = {
       /**
@@ -333,13 +322,9 @@ private[akka] class AffinityPool(
       }
     }
 
-    def stop(): Unit =
-      if (!thread.isInterrupted && workerState != NotStarted)
-        thread.interrupt()
+    def stop(): Unit = if (!thread.isInterrupted) thread.interrupt()
 
-    def stopIfIdle(): Unit =
-      if (workerState == Idle)
-        stop()
+    def stopIfIdle(): Unit = if (!executing) stop()
   }
 }
 
