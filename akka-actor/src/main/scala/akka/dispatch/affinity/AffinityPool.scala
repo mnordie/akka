@@ -304,23 +304,15 @@ private[akka] class AffinityPool(
       finally
         workerState = Idle
     }
-
     override final def run(): Unit = {
       /**
-       * Determines whether the worker can keep running or not.
-       * In order to continue polling for tasks three conditions
-       * need to be satisfied:
-       *
-       * 1) pool state is less than Shutting down or queue
-       * is not empty (e.g pool state is ShuttingDown but there are still messages to process)
-       *
-       * 2) the thread backing up this worker has not been interrupted
-       *
-       * 3) We are not in ShutDown state (in which we should not be processing any enqueued tasks)
+       * We keep running as long as we are Running
+       * or we're ShuttingDown but we still have tasks to execute,
+       * and we're not interrupted.
        */
       @tailrec def runLoop(): Unit = {
-        val ps = poolState
-        if ((ps < ShuttingDown || !q.isEmpty) && !Thread.interrupted() && ps != ShutDown) {
+        val ps = poolState // Single volatile read
+        if (((ps == Running) || (ps == ShuttingDown && !q.isEmpty)) && !Thread.interrupted()) {
           val c = q.poll()
           if (c ne null) {
             runCommand(c)
