@@ -280,38 +280,48 @@ private[akka] class AffinityPool(
 
   override def isTerminated: Boolean = poolState == Terminated
 
-  private final class AffinityPoolWorker(val q: BoundedAffinityTaskQueue, val idleStrategy: IdleStrategy) extends Runnable {
+  private final class AffinityPoolWorker( final val q: BoundedAffinityTaskQueue, final val idleStrategy: IdleStrategy) extends Runnable {
     final val thread: Thread = tf.newThread(this)
     @volatile private[this] var executing: Boolean = false
 
     def startWorker(): Unit = thread.start()
 
-    private[this] final def runCommand(command: Runnable): Unit = {
-      executing = true
-      try
-        command.run()
-      finally
-        executing = false
-    }
     override final def run(): Unit = {
+
+      def executeNext(): Unit = {
+        val c = q.poll()
+        if (c ne null) {
+          executing = true
+          try
+            c.run()
+          finally
+            executing = false
+          idleStrategy.reset()
+        } else {
+          idleStrategy.idle() // if not wait for a bit
+        }
+      }
+
       /**
        * We keep running as long as we are Running
        * or we're ShuttingDown but we still have tasks to execute,
        * and we're not interrupted.
        */
-      @tailrec def runLoop(): Unit = {
-        val ps = poolState // Single volatile read
-        if (((ps == Running) || (ps == ShuttingDown && !q.isEmpty)) && !Thread.interrupted()) {
-          val c = q.poll()
-          if (c ne null) {
-            runCommand(c)
-            idleStrategy.reset()
-          } else {
-            idleStrategy.idle() // if not wait for a bit
+      @tailrec def runLoop(): Unit =
+        if (!Thread.interrupted()) {
+          (poolState: @switch) match {
+            case Running ⇒
+              executeNext()
+              runLoop()
+            case ShuttingDown ⇒
+              if (!q.isEmpty)
+                executeNext()
+              else
+                ()
+            case ShutDown   ⇒ ()
+            case Terminated ⇒ ()
           }
-          runLoop()
         }
-      }
 
       var abruptTermination = true
       try {
