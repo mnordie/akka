@@ -33,7 +33,7 @@ import scala.annotation.tailrec
         if (k < key) find((lohi >>> 1) + 1, hi)
         else if (k > key) find(lo, (lohi >>> 1) - 1)
         else idx
-      } else -((lo << 1) + 1) // Item should be placed in lo*2+1, negated to indicate no match
+      } else ~(lo << 1) // same as -((lo*2)+1): Item should be placed, negated to indicate no match
 
     find(0, size - 1)
   }
@@ -83,7 +83,7 @@ import scala.annotation.tailrec
   }
 
   private[this] final def insert(key: Int, value: Int, index: Int): ImmutableIntMap = {
-    val at = -(index + 1) // insert the entry at the right position—keep the array sorted
+    val at = ~index // ~n == -(n + 1): insert the entry at the right position—keep the array sorted
     val newKvs = new Array[Int](kvs.length + 2)
     System.arraycopy(kvs, 0, newKvs, 0, at)
     newKvs(at) = key
