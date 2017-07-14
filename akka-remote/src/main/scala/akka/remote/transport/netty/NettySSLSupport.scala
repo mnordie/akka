@@ -9,18 +9,17 @@ import java.security.{ KeyStore, _ }
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl._
 
+import akka.actor.{ Address, ReflectiveDynamicAccess }
 import akka.event.{ LogMarker, MarkerLoggingAdapter }
 import akka.japi.Util._
 import akka.remote.RemoteTransportException
 import akka.remote.security.provider.AkkaProvider
+import akka.util.Collections.EmptyImmutableSeq
 import com.typesafe.config.Config
 import org.jboss.netty.handler.ssl.SslHandler
 
 import scala.annotation.tailrec
-import scala.util.Try
-
-import akka.actor.Address
-import akka.remote.customtrust.TrustManagerReflectionHelper
+import scala.util.{ Failure, Success, Try }
 /**
  * INTERNAL API
  */
@@ -70,14 +69,17 @@ private[akka] class SSLSettings(config: Config) {
         factory.init(loadKeystore(SSLKeyStore, SSLKeyStorePassword), SSLKeyPassword.toCharArray)
         factory.getKeyManagers
       }
-      val trustManagers = if (SSLTrustManagerFactoryClass.isEmpty() || "".equals(SSLTrustManagerFactoryClass)) {
+      val trustManagers = if (SSLTrustManagerFactoryClass.isEmpty) {
         val trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm)
         trustManagerFactory.init(loadKeystore(SSLTrustStore, SSLTrustStorePassword))
         trustManagerFactory.getTrustManagers
       } else {
-        TrustManagerReflectionHelper.getFactoryInstance(SSLTrustManagerFactoryClass).create(SSLTrustStore, SSLTrustStorePassword)
+        val dynamicAccess = new ReflectiveDynamicAccess(getClass.getClassLoader)
+        dynamicAccess.createInstanceFor[CustomTrustManagerFactory](SSLTrustManagerFactoryClass, EmptyImmutableSeq) match {
+          case Success(factory: CustomTrustManagerFactory) ⇒ factory.create(SSLTrustStore, SSLTrustStorePassword)
+          case Failure(problem)                            ⇒ throw new RemoteTransportException("Failed to instantiate custom trust manager", problem)
+        }
       }
-
       val rng = createSecureRandom(log)
 
       val ctx = SSLContext.getInstance(SSLProtocol)
@@ -150,6 +152,7 @@ private[akka] object NettySSLSupport {
     sslEngine.setUseClientMode(isClient)
     sslEngine.setEnabledCipherSuites(settings.SSLEnabledAlgorithms.toArray)
     sslEngine.setEnabledProtocols(Array(settings.SSLProtocol))
+
     new SslHandler(sslEngine)
   }
 }
