@@ -5,9 +5,9 @@
 package akka.remote.transport.netty
 
 import java.io.{ FileInputStream, FileNotFoundException, IOException }
-import java.security._
+import java.security.{ KeyStore, _ }
 import java.util.concurrent.atomic.AtomicReference
-import javax.net.ssl.{ KeyManagerFactory, SSLContext, TrustManagerFactory }
+import javax.net.ssl._
 
 import akka.event.{ LogMarker, MarkerLoggingAdapter }
 import akka.japi.Util._
@@ -19,6 +19,8 @@ import org.jboss.netty.handler.ssl.SslHandler
 import scala.annotation.tailrec
 import scala.util.Try
 
+import akka.actor.Address
+import akka.remote.customtrust.TrustManagerReflectionHelper
 /**
  * INTERNAL API
  */
@@ -39,6 +41,9 @@ private[akka] class SSLSettings(config: Config) {
   val SSLRandomNumberGenerator = getString("random-number-generator")
 
   val SSLRequireMutualAuthentication = getBoolean("require-mutual-authentication")
+  val SSLRequireHostnameValidation = getBoolean("require-hostname-validation")
+
+  val SSLTrustManagerFactoryClass = getString("trust-manager-factory-class")
 
   private val sslContext = new AtomicReference[SSLContext]()
   @tailrec final def getOrCreateContext(log: MarkerLoggingAdapter): SSLContext =
@@ -64,10 +69,12 @@ private[akka] class SSLSettings(config: Config) {
         factory.init(loadKeystore(SSLKeyStore, SSLKeyStorePassword), SSLKeyPassword.toCharArray)
         factory.getKeyManagers
       }
-      val trustManagers = {
+      val trustManagers = if (SSLTrustManagerFactoryClass.isEmpty() || "".equals(SSLTrustManagerFactoryClass)) {
         val trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm)
         trustManagerFactory.init(loadKeystore(SSLTrustStore, SSLTrustStorePassword))
         trustManagerFactory.getTrustManagers
+      } else {
+        TrustManagerReflectionHelper.getFactoryInstance(SSLTrustManagerFactoryClass).create(SSLTrustStore, SSLTrustStorePassword)
       }
       val rng = createSecureRandom(log)
 
@@ -120,13 +127,27 @@ private[akka] object NettySSLSupport {
   /**
    * Construct a SSLHandler which can be inserted into a Netty server/client pipeline
    */
-  def apply(settings: SSLSettings, log: MarkerLoggingAdapter, isClient: Boolean): SslHandler = {
-    val sslEngine = settings.getOrCreateContext(log).createSSLEngine // TODO: pass host information to enable host verification
+  def apply(settings: SSLSettings, log: MarkerLoggingAdapter, isClient: Boolean, remoteAddress: Address): SslHandler = {
+    val context = settings.getOrCreateContext(log)
+    val sslEngine =
+      if (remoteAddress != null && remoteAddress.hasGlobalScope && settings.SSLRequireHostnameValidation)
+        context.createSSLEngine(remoteAddress.host.get, remoteAddress.port.get)
+      else
+        context.createSSLEngine()
+
+    val sslParams = new SSLParameters()
+    if (!isClient && settings.SSLRequireMutualAuthentication) sslParams.setNeedClientAuth(true)
+
+    if (remoteAddress != null && // If we don't have remote host address and
+      remoteAddress.hasGlobalScope && // enable endpoint verification the handshake will fail with
+      settings.SSLRequireHostnameValidation) // fatal error: 80: problem unwrapping net record
+      sslParams.setEndpointIdentificationAlgorithm("HTTPS")
+
+    sslEngine.setSSLParameters(sslParams)
     sslEngine.setUseClientMode(isClient)
     sslEngine.setEnabledCipherSuites(settings.SSLEnabledAlgorithms.toArray)
     sslEngine.setEnabledProtocols(Array(settings.SSLProtocol))
 
-    if (!isClient && settings.SSLRequireMutualAuthentication) sslEngine.setNeedClientAuth(true)
     new SslHandler(sslEngine)
   }
 }
