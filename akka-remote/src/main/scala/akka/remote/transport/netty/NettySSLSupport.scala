@@ -41,6 +41,7 @@ private[akka] class SSLSettings(config: Config) {
   val SSLRandomNumberGenerator = getString("random-number-generator")
 
   val SSLRequireMutualAuthentication = getBoolean("require-mutual-authentication")
+
   val SSLRequireHostnameValidation = getBoolean("require-hostname-validation")
 
   val SSLTrustManagerFactoryClass = getString("trust-manager-factory-class")
@@ -76,6 +77,7 @@ private[akka] class SSLSettings(config: Config) {
       } else {
         TrustManagerReflectionHelper.getFactoryInstance(SSLTrustManagerFactoryClass).create(SSLTrustStore, SSLTrustStorePassword)
       }
+
       val rng = createSecureRandom(log)
 
       val ctx = SSLContext.getInstance(SSLProtocol)
@@ -124,30 +126,30 @@ private[akka] object NettySSLSupport {
 
   Security addProvider AkkaProvider
 
+  def apply(settings: SSLSettings, log: MarkerLoggingAdapter, isClient: Boolean): SslHandler = apply(settings, log, isClient, None)
   /**
    * Construct a SSLHandler which can be inserted into a Netty server/client pipeline
    */
-  def apply(settings: SSLSettings, log: MarkerLoggingAdapter, isClient: Boolean, remoteAddress: Address): SslHandler = {
+  def apply(settings: SSLSettings, log: MarkerLoggingAdapter, isClient: Boolean, remoteAddress: Option[Address]): SslHandler = {
     val context = settings.getOrCreateContext(log)
-    val sslEngine =
-      if (remoteAddress != null && remoteAddress.hasGlobalScope && settings.SSLRequireHostnameValidation)
-        context.createSSLEngine(remoteAddress.host.get, remoteAddress.port.get)
-      else
-        context.createSSLEngine()
+    val sslEngine = remoteAddress match {
+      case Some(address) if address.hasGlobalScope && settings.SSLRequireHostnameValidation ⇒ context.createSSLEngine(address.host.get, address.port.get)
+      case _ ⇒ context.createSSLEngine()
+    }
 
     val sslParams = new SSLParameters()
     if (!isClient && settings.SSLRequireMutualAuthentication) sslParams.setNeedClientAuth(true)
 
-    if (remoteAddress != null && // If we don't have remote host address and
-      remoteAddress.hasGlobalScope && // enable endpoint verification the handshake will fail with
-      settings.SSLRequireHostnameValidation) // fatal error: 80: problem unwrapping net record
+    if (settings.SSLRequireHostnameValidation && (remoteAddress exists (_.hasGlobalScope)))
+      // If we don't have remote host address, like when called for the server side, and
+      // enable endpoint verification the handshake will fail with
+      // "fatal error: 80: problem unwrapping net record"
       sslParams.setEndpointIdentificationAlgorithm("HTTPS")
 
     sslEngine.setSSLParameters(sslParams)
     sslEngine.setUseClientMode(isClient)
     sslEngine.setEnabledCipherSuites(settings.SSLEnabledAlgorithms.toArray)
     sslEngine.setEnabledProtocols(Array(settings.SSLProtocol))
-
     new SslHandler(sslEngine)
   }
 }
