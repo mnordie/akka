@@ -43,6 +43,7 @@ private[akka] class SSLSettings(config: Config) {
   val SSLRandomNumberGenerator = getString("random-number-generator")
 
   val SSLRequireMutualAuthentication = getBoolean("require-mutual-authentication")
+
   val SSLRequireHostnameValidation = getBoolean("require-hostname-validation")
 
   val SSLTrustManagerFactoryClass = getString("trust-manager-factory-class")
